@@ -1,6 +1,6 @@
 # 0001: v1 Problem Statement
 
-- **Status:** Draft
+- **Status:** Accepted
 - **Author:** the-coderbee
 - **Date:** 2026-10-08
 
