@@ -2,9 +2,10 @@
 use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
+use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
 
 /// Pause before accepting again after running out of resources, giving
@@ -13,6 +14,46 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(300);
 
 /// Size of the buffer each connection reads into.
 const READ_BUFFER_SIZE: usize = 1024;
+
+/// How long to wait for a backend connection before giving up.
+///
+/// Connecting within the same datacenter normally takes well under 1 ms,
+/// so 300 ms leaves ample headroom while still failing fast when a backend
+/// silently drops packets.
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// Errors that can occur while connecting to a backend.
+///
+/// No client data has been sent to the backend when one of these occurs,
+/// so trying another backend is always safe.
+#[derive(Error, Debug)]
+enum ConnectError {
+    /// The backend did not accept the connection within [`CONNECT_TIMEOUT`].
+    #[error("timed out connecting to backend {backend}")]
+    TimedOut { backend: SocketAddr },
+
+    /// Connecting failed with an operating system error, such as the connection
+    /// being refused or the backend being unreachable.
+    /// `source` holds the specific cause.
+    #[error("failed to connect to backend {backend}")]
+    Failed {
+        backend: SocketAddr,
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// Errors that end a client connection.
+#[derive(Debug, Error)]
+enum ConnectionError {
+    /// Connecting to the backend failed.
+    #[error(transparent)]
+    Connect(#[from] ConnectError),
+
+    /// An I/O operation on an established connection failed.
+    #[error(transparent)]
+    Io(#[from] io::Error),
+}
 
 /// Returns true if an `accept` error means the process or system is
 /// out of resources, rather than a problem with one connection. Unix-only.
@@ -23,19 +64,42 @@ fn is_resource_exhaustion(error: &io::Error) -> bool {
     )
 }
 
-/// Reads from a client connection until the client disconnects.
-///
-/// Received data is logged and discarded. This is a placeholder
-/// until forwarding to a backend is implemented.
+/// Opens a TCP connection to `backend`, giving up after [`CONNECT_TIMEOUT`].
 ///
 /// # Errors
 ///
-/// Returns an error if reading from the client fails, for example
-/// because the connection was reset. A normal disconnect returns `Ok(())`.
-async fn handle_client(mut stream: TcpStream, client_addr: SocketAddr) -> io::Result<()> {
-    info!(client = %client_addr, "accepted connection");
-    let mut buffer = [0u8; READ_BUFFER_SIZE];
+/// Returns [`ConnectError::TimedOut`] if the backend does not respond in time,
+/// and [`ConnectError::Failed`] if the connection attempt fails with an operating
+/// system error.
+async fn connect_to_backend(backend: SocketAddr) -> Result<TcpStream, ConnectError> {
+    match timeout(CONNECT_TIMEOUT, TcpStream::connect(backend)).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(source)) => Err(ConnectError::Failed { backend, source }),
+        Err(_elapsed) => Err(ConnectError::TimedOut { backend }),
+    }
+}
 
+/// Connects the client to `backend`, then reads from the client until
+/// it disconnects.
+///
+/// The backend connection is held open for the lifetime of the client
+/// connection. Received client data is logged and discarded; this is
+/// a placeholder until forwarding is implemented.
+///
+/// # Errors
+///
+/// Returns [`ConnectionError::Connect`] if the backend connection cannot
+/// be established, and [`ConnectionError::Io`] if reading from the client
+/// fails. A normal client disconnect returns `Ok(())`.
+async fn handle_client(
+    mut stream: TcpStream,
+    client_addr: SocketAddr,
+    backend: SocketAddr,
+) -> Result<(), ConnectionError> {
+    info!(client = %client_addr, "accepted connection");
+    let _backend_stream = connect_to_backend(backend).await?;
+    info!(%backend, client = %client_addr, "connected to backend");
+    let mut buffer = [0u8; READ_BUFFER_SIZE];
     loop {
         let bytes_read = stream.read(&mut buffer).await?;
 
@@ -56,13 +120,13 @@ async fn handle_client(mut stream: TcpStream, client_addr: SocketAddr) -> io::Re
 /// loop pauses briefly (300 ms) before accepting again, so the
 /// proxy does not spin while overloaded. Other accept errors are logged
 /// and accepting connection continues immediately.
-pub async fn run(listener: TcpListener) {
+pub async fn run(listener: TcpListener, backend: SocketAddr) {
     loop {
         match listener.accept().await {
             Ok((stream, client_addr)) => {
                 tokio::spawn(async move {
-                    if let Err(error) = handle_client(stream, client_addr).await {
-                        warn!(client = %client_addr, %error, "connection ended with error");
+                    if let Err(error) = handle_client(stream, client_addr, backend).await {
+                        warn!(client = %client_addr, error = &error as &dyn std::error::Error, "connection ended with error");
                     }
                 });
             }
