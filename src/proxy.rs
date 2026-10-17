@@ -6,7 +6,7 @@ use thiserror::Error;
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout};
-use tracing::{Instrument, error, info, info_span, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 /// Pause before accepting again after running out of resources, giving
 /// existing connections time to close and free file descriptors.
@@ -100,6 +100,21 @@ async fn handle_client(
     Ok(())
 }
 
+/// Logs a connection error at a level reflecting whether the operator
+/// needs to act: backend failures at `warn`, client-side I/O errors at `debug`.
+fn log_connection_error(error: &ConnectionError) {
+    match &error {
+        ConnectionError::Connect(_) => warn!(
+            error = error as &dyn std::error::Error,
+            "failed to connect to backend"
+        ),
+        ConnectionError::Io(_) => debug!(
+            error = error as &dyn std::error::Error,
+            "connection ended with error"
+        ),
+    }
+}
+
 /// Accepts connections from `listener` and handles each one on its own task.
 ///
 /// This function runs until the process exits and never returns.
@@ -117,10 +132,7 @@ pub async fn run(listener: TcpListener, backend: SocketAddr) {
                 tokio::spawn(
                     async move {
                         if let Err(error) = handle_client(stream, backend).await {
-                            warn!(
-                                error = &error as &dyn std::error::Error,
-                                "connection ended with error"
-                            );
+                            log_connection_error(&error);
                         }
                     }
                     .instrument(span),
