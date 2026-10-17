@@ -3,17 +3,14 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
+use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout};
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, error, info, info_span, warn};
 
 /// Pause before accepting again after running out of resources, giving
 /// existing connections time to close and free file descriptors.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(300);
-
-/// Size of the buffer each connection reads into.
-const READ_BUFFER_SIZE: usize = 1024;
 
 /// How long to wait for a backend connection before giving up.
 ///
@@ -83,8 +80,7 @@ async fn connect_to_backend(backend: SocketAddr) -> Result<TcpStream, ConnectErr
 /// it disconnects.
 ///
 /// The backend connection is held open for the lifetime of the client
-/// connection. Received client data is logged and discarded; this is
-/// a placeholder until forwarding is implemented.
+/// connection. Received client data is logged.
 ///
 /// # Errors
 ///
@@ -92,23 +88,16 @@ async fn connect_to_backend(backend: SocketAddr) -> Result<TcpStream, ConnectErr
 /// be established, and [`ConnectionError::Io`] if reading from the client
 /// fails. A normal client disconnect returns `Ok(())`.
 async fn handle_client(
-    mut stream: TcpStream,
-    client_addr: SocketAddr,
+    mut client_stream: TcpStream,
     backend: SocketAddr,
 ) -> Result<(), ConnectionError> {
-    info!(client = %client_addr, "accepted connection");
-    let _backend_stream = connect_to_backend(backend).await?;
-    info!(%backend, client = %client_addr, "connected to backend");
-    let mut buffer = [0u8; READ_BUFFER_SIZE];
-    loop {
-        let bytes_read = stream.read(&mut buffer).await?;
-
-        if bytes_read == 0 {
-            info!(client = %client_addr, "client closed connection");
-            return Ok(());
-        }
-        debug!(client = %client_addr, bytes = bytes_read, "received data");
-    }
+    info!("accepted connection");
+    let mut backend_stream = connect_to_backend(backend).await?;
+    info!(%backend, "connected to backend");
+    let (bytes_to_backend, bytes_to_client) =
+        copy_bidirectional(&mut client_stream, &mut backend_stream).await?;
+    info!(bytes_to_backend, bytes_to_client, "connection ended");
+    Ok(())
 }
 
 /// Accepts connections from `listener` and handles each one on its own task.
@@ -124,11 +113,18 @@ pub async fn run(listener: TcpListener, backend: SocketAddr) {
     loop {
         match listener.accept().await {
             Ok((stream, client_addr)) => {
-                tokio::spawn(async move {
-                    if let Err(error) = handle_client(stream, client_addr, backend).await {
-                        warn!(client = %client_addr, error = &error as &dyn std::error::Error, "connection ended with error");
+                let span = info_span!("connection", client=%client_addr);
+                tokio::spawn(
+                    async move {
+                        if let Err(error) = handle_client(stream, backend).await {
+                            warn!(
+                                error = &error as &dyn std::error::Error,
+                                "connection ended with error"
+                            );
+                        }
                     }
-                });
+                    .instrument(span),
+                );
             }
             Err(error) if is_resource_exhaustion(&error) => {
                 error!(%error, "accept failed: out of resources, pausing");
