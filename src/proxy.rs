@@ -1,6 +1,7 @@
 //! The proxy for accepting connections and handling them.
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::copy_bidirectional;
@@ -8,7 +9,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout};
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
-use crate::config::DEFAULT_CONNECT_TIMEOUT;
+use crate::balancer::RoundRobin;
+use crate::config::ProxyConfig;
 
 /// Pause before accepting again after running out of resources, giving
 /// existing connections time to close and free file descriptors.
@@ -20,7 +22,7 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(300);
 /// so trying another backend is always safe.
 #[derive(Error, Debug)]
 enum ConnectError {
-    /// The backend did not accept the connection within [`CONNECT_TIMEOUT`].
+    /// The backend did not accept the connection within the connect timeout.
     #[error("timed out connecting to backend {backend}")]
     TimedOut { backend: SocketAddr },
 
@@ -38,9 +40,9 @@ enum ConnectError {
 /// Errors that end a client connection.
 #[derive(Debug, Error)]
 enum ConnectionError {
-    /// Connecting to the backend failed.
-    #[error(transparent)]
-    Connect(#[from] ConnectError),
+    /// Connecting to all the backends failed.
+    #[error("all {attempted} backends failed")]
+    AllBackendsFailed { attempted: usize },
 
     /// An I/O operation on an established connection failed.
     #[error(transparent)]
@@ -56,52 +58,71 @@ fn is_resource_exhaustion(error: &io::Error) -> bool {
     )
 }
 
-/// Opens a TCP connection to `backend`, giving up after [`CONNECT_TIMEOUT`].
+/// Opens a TCP connection to `backend`, giving up after connect timeout.
 ///
 /// # Errors
 ///
 /// Returns [`ConnectError::TimedOut`] if the backend does not respond in time,
 /// and [`ConnectError::Failed`] if the connection attempt fails with an operating
 /// system error.
-async fn connect_to_backend(backend: SocketAddr) -> Result<TcpStream, ConnectError> {
-    match timeout(DEFAULT_CONNECT_TIMEOUT, TcpStream::connect(backend)).await {
+async fn connect_to_backend(
+    backend: SocketAddr,
+    connect_timeout: Duration,
+) -> Result<TcpStream, ConnectError> {
+    match timeout(connect_timeout, TcpStream::connect(backend)).await {
         Ok(Ok(stream)) => Ok(stream),
         Ok(Err(source)) => Err(ConnectError::Failed { backend, source }),
         Err(_elapsed) => Err(ConnectError::TimedOut { backend }),
     }
 }
 
-/// Connects the client to `backend`, then reads from the client until
-/// it disconnects.
+/// Connects the client to the first available backend and forwards
+/// traffic in both directions until either side closes.
 ///
-/// The backend connection is held open for the lifetime of the client
-/// connection. Received client data is logged.
+/// Backends are tried in the order given by [`RoundRobin::candidates`],
+/// each at most once. A failed attempt is logged and the next candidate
+/// is tried.
 ///
 /// # Errors
 ///
-/// Returns [`ConnectionError::Connect`] if the backend connection cannot
-/// be established, and [`ConnectionError::Io`] if reading from the client
-/// fails. A normal client disconnect returns `Ok(())`.
+/// Returns [`ConnectionError::AllBackendsFailed`] if no backend could be
+/// connected, and [`ConnectionError::Io`] if forwarding fails. A normal
+/// close returns `Ok(())`.
 async fn handle_client(
     mut client_stream: TcpStream,
-    backend: SocketAddr,
+    balancer: &RoundRobin,
+    config: ProxyConfig,
 ) -> Result<(), ConnectionError> {
     info!("accepted connection");
-    let mut backend_stream = connect_to_backend(backend).await?;
-    info!(%backend, "connected to backend");
-    let (bytes_to_backend, bytes_to_client) =
-        copy_bidirectional(&mut client_stream, &mut backend_stream).await?;
-    info!(bytes_to_backend, bytes_to_client, "connection ended");
-    Ok(())
+    let mut attempted = 0;
+    for backend in balancer.candidates() {
+        match connect_to_backend(backend, config.connect_timeout).await {
+            Ok(mut backend_stream) => {
+                info!(%backend, "connected to backend");
+                let (bytes_to_backend, bytes_to_client) =
+                    copy_bidirectional(&mut client_stream, &mut backend_stream).await?;
+                info!(bytes_to_backend, bytes_to_client, "connection ended");
+                return Ok(());
+            }
+            Err(error) => {
+                warn!(
+                    error = &error as &dyn std::error::Error,
+                    "backend connection failed"
+                );
+                attempted += 1;
+            }
+        }
+    }
+    Err(ConnectionError::AllBackendsFailed { attempted })
 }
 
 /// Logs a connection error at a level reflecting whether the operator
 /// needs to act: backend failures at `warn`, client-side I/O errors at `debug`.
 fn log_connection_error(error: &ConnectionError) {
-    match &error {
-        ConnectionError::Connect(_) => warn!(
+    match error {
+        ConnectionError::AllBackendsFailed { attempted } => error!(
             error = error as &dyn std::error::Error,
-            "failed to connect to backend"
+            "all {attempted} backends failed, no backends available"
         ),
         ConnectionError::Io(_) => debug!(
             error = error as &dyn std::error::Error,
@@ -119,14 +140,15 @@ fn log_connection_error(error: &ConnectionError) {
 /// loop pauses briefly (300 ms) before accepting again, so the
 /// proxy does not spin while overloaded. Other accept errors are logged
 /// and accepting connection continues immediately.
-pub async fn run(listener: TcpListener, backend: SocketAddr) {
+pub async fn run(listener: TcpListener, config: ProxyConfig, balancer: Arc<RoundRobin>) {
     loop {
         match listener.accept().await {
             Ok((stream, client_addr)) => {
-                let span = info_span!("connection", client=%client_addr);
+                let span = info_span!("connection", client = %client_addr);
+                let balancer = Arc::clone(&balancer);
                 tokio::spawn(
                     async move {
-                        if let Err(error) = handle_client(stream, backend).await {
+                        if let Err(error) = handle_client(stream, &balancer, config).await {
                             log_connection_error(&error);
                         }
                     }

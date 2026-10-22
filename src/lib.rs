@@ -6,4 +6,7 @@ mod proxy;
 pub use proxy::run;
 
 mod balancer;
-pub mod config;
+pub use balancer::RoundRobin;
+
+mod config;
+pub use config::ProxyConfig;
