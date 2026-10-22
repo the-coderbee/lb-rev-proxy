@@ -8,16 +8,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout};
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
+use crate::config::DEFAULT_CONNECT_TIMEOUT;
+
 /// Pause before accepting again after running out of resources, giving
 /// existing connections time to close and free file descriptors.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(300);
-
-/// How long to wait for a backend connection before giving up.
-///
-/// Connecting within the same datacenter normally takes well under 1 ms,
-/// so 300 ms leaves ample headroom while still failing fast when a backend
-/// silently drops packets.
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// Errors that can occur while connecting to a backend.
 ///
@@ -69,7 +64,7 @@ fn is_resource_exhaustion(error: &io::Error) -> bool {
 /// and [`ConnectError::Failed`] if the connection attempt fails with an operating
 /// system error.
 async fn connect_to_backend(backend: SocketAddr) -> Result<TcpStream, ConnectError> {
-    match timeout(CONNECT_TIMEOUT, TcpStream::connect(backend)).await {
+    match timeout(DEFAULT_CONNECT_TIMEOUT, TcpStream::connect(backend)).await {
         Ok(Ok(stream)) => Ok(stream),
         Ok(Err(source)) => Err(ConnectError::Failed { backend, source }),
         Err(_elapsed) => Err(ConnectError::TimedOut { backend }),
