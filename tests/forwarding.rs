@@ -2,42 +2,15 @@ use std::{net::SocketAddr, time::Duration};
 
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
 };
 
-/// Starts an echo server on a free port and returns its address.
-/// The server runs in the background for the rest of the test.
-async fn start_echo_server() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("failed to bind echo server");
-    let address = listener
-        .local_addr()
-        .expect("failed to read echo server address");
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                return;
-            };
-            tokio::spawn(async move {
-                let (mut reader, mut writer) = stream.split();
-                let _ = tokio::io::copy(&mut reader, &mut writer).await;
-            });
-        }
-    });
-    address
-}
+mod common;
 
 #[tokio::test]
 async fn forwards_data_to_backend_and_back() {
-    let backend_address = start_echo_server().await;
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("failed to bind proxy listener");
-    let proxy_address = listener.local_addr().expect("failed to read proxy address");
-    tokio::spawn(async move {
-        lb_rev_proxy::run(listener, backend_address).await;
-    });
+    let backends: Vec<SocketAddr> = vec![common::start_echo_server().await];
+    let proxy_address = common::start_proxy(backends).await;
     let message = b"hello through the proxy";
     let echoed = tokio::time::timeout(Duration::from_secs(3), async {
         let mut client = TcpStream::connect(proxy_address)
@@ -58,4 +31,19 @@ async fn forwards_data_to_backend_and_back() {
     .await
     .expect("timed out waiting for echoed data");
     assert_eq!(echoed, message);
+}
+
+#[tokio::test]
+async fn connections_rotate_across_backends() {
+    let mut backends: Vec<SocketAddr> = Vec::with_capacity(3);
+    for _ in 0..3 {
+        backends.push(common::start_identifying_server().await);
+    }
+    let proxy_address = common::start_proxy(backends.clone()).await;
+
+    for expected in backends.iter().cycle().take(4) {
+        let response = common::read_response(proxy_address).await;
+
+        assert_eq!(response, expected.to_string());
+    }
 }
