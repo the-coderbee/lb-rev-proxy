@@ -10,3 +10,5 @@ pub use balancer::RoundRobin;
 
 mod config;
 pub use config::ProxyConfig;
+
+mod health;
