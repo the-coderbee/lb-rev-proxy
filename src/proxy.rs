@@ -9,8 +9,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout};
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
+use crate::backend::Backend;
 use crate::balancer::RoundRobin;
 use crate::config::ProxyConfig;
+use crate::health::Transition;
 
 /// Pause before accepting again after running out of resources, giving
 /// existing connections time to close and free file descriptors.
@@ -96,15 +98,17 @@ async fn handle_client(
     info!("accepted connection");
     let mut attempted = 0;
     for backend in balancer.candidates() {
-        match connect_to_backend(backend, config.connect_timeout).await {
+        match connect_to_backend(backend.address(), config.connect_timeout).await {
             Ok(mut backend_stream) => {
-                info!(%backend, "connected to backend");
+                log_transition(backend, backend.record_success());
+                info!(backend = %backend.address(), "connected to backend");
                 let (bytes_to_backend, bytes_to_client) =
                     copy_bidirectional(&mut client_stream, &mut backend_stream).await?;
                 info!(bytes_to_backend, bytes_to_client, "connection ended");
                 return Ok(());
             }
             Err(error) => {
+                log_transition(backend, backend.record_failure());
                 warn!(
                     error = &error as &dyn std::error::Error,
                     "backend connection failed"
@@ -163,5 +167,18 @@ pub async fn run(listener: TcpListener, config: ProxyConfig, balancer: Arc<Round
                 warn!(%error, "accept failed");
             }
         }
+    }
+}
+
+/// Logs a change of a backend's mode, if `transition` reports one.
+fn log_transition(backend: &Backend, transition: Option<Transition>) {
+    match transition {
+        Some(Transition::WentDown) => {
+            warn!(backend = %backend.address(), "backend marked down");
+        }
+        Some(Transition::CameUp) => {
+            info!(backend = %backend.address(), "backend marked up");
+        }
+        None => {}
     }
 }

@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use anyhow::{Context, Result};
-use lb_rev_proxy::{ProxyConfig, RoundRobin};
+use lb_rev_proxy::{ProxyConfig, RoundRobin, Thresholds};
 use rlimit::Resource;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -27,7 +27,9 @@ async fn main() -> Result<()> {
         })
         .collect::<Result<_>>()?;
     info!(?backends, "backends configured");
-    let balancer = RoundRobin::new(backends).context("failed to create the balancer")?;
+    let thresholds: Thresholds = Thresholds::new(3, 2).context("invalid health thresholds")?;
+    let balancer =
+        RoundRobin::new(backends, thresholds).context("failed to create the balancer")?;
     match Resource::NOFILE.get() {
         Ok((soft, hard)) => info!(soft, hard, "file descriptor limit"),
         Err(error) => warn!(%error, "failed to read file descriptor limit"),

@@ -9,7 +9,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
-use lb_rev_proxy::{ProxyConfig, RoundRobin};
+use lb_rev_proxy::{ProxyConfig, RoundRobin, Thresholds};
 
 /// Starts the proxy with the given backends on a free port and returns
 /// the proxy's address.
@@ -17,7 +17,8 @@ use lb_rev_proxy::{ProxyConfig, RoundRobin};
 /// The proxy runs in the background for the rest
 /// of the test.
 pub async fn start_proxy(backends: Vec<SocketAddr>) -> SocketAddr {
-    let balancer = RoundRobin::new(backends).expect("failed to create balancer");
+    let balancer = RoundRobin::new(backends, Thresholds::new(3, 2).unwrap())
+        .expect("failed to create balancer");
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("failed to bind proxy listener");

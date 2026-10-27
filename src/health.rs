@@ -1,31 +1,54 @@
-//! Health check module
+//! Rules for how a backend's health state changes.
+//!
+//! A backend's health is a single `i8` that records both its mode (Up or
+//! Down) and its current streak of consecutive results. [`next_state`]
+//! applies one check result to a state, and [`transition`] reports whether
+//! a change of state also changed the mode. Everything here is pure logic,
+//! with no atomics or I/O, so the rules can be tested exhaustively.
 use thiserror::Error;
 
+/// Error returned when a health threshold is outside the valid range.
 #[derive(Debug, Error)]
 #[error("health thresholds must be between 1 and 127")]
 pub struct InvalidThresholds;
 
-/// Enum for check result.
-///
-/// It tells if a connection succeeded or failed.
+/// The outcome of one health check or one connection attempt to a backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CheckResult {
+    /// The backend accepted the connection.
     Success,
+    /// The connection attempt failed or timed out.
     Failure,
 }
 
-/// Threshold contains the min and max values for fall and rise
-/// which determines how many consecutive failures or successes
-/// can happen and when they trigger a mode change.
+/// A change of a backend's mode caused by a check result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Transition {
+    /// The backend switched from Up to Down.
+    WentDown,
+    /// The backend switched from Down to Up.
+    CameUp,
+}
+
+/// How many consecutive results it takes to change a backend's mode.
+///
+/// Both values are between 1 and 127; [`Thresholds::new`] rejects anything
+/// else, which keeps the state arithmetic in [`next_state`] within `i8`.
 #[derive(Debug, Clone, Copy)]
 pub struct Thresholds {
-    /// Number of failures before the mode is switched to Down.
+    /// Consecutive failures that switch an Up backend to Down.
     fall: i8,
-    /// Number of success after which the mode is switched to Up.
+    /// Consecutive successes that switch a Down backend to Up.
     rise: i8,
 }
 
 impl Thresholds {
+    /// Creates thresholds from the number of consecutive failures (`fall`)
+    /// and consecutive successes (`rise`) needed to change mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidThresholds`] if either value is 0 or greater than 127.
     pub fn new(fall: u8, rise: u8) -> Result<Self, InvalidThresholds> {
         if fall == 0 || rise == 0 {
             return Err(InvalidThresholds);
@@ -63,19 +86,33 @@ pub(crate) fn next_state(state: i8, result: CheckResult, thresholds: &Thresholds
     }
 }
 
-/// A helper function that tells if a backend is up or down.
+/// Returns `true` if `state` means the backend is Up.
 pub(crate) fn is_up(state: i8) -> bool {
     state >= 0
+}
+
+/// Returns the mode change between two health states, if any.
+///
+/// Only the mode matters, not the streak: moving from one Up state to
+/// another (or one Down state to another) returns `None`.
+pub(crate) fn transition(previous: i8, new: i8) -> Option<Transition> {
+    match (is_up(previous), is_up(new)) {
+        (true, false) => Some(Transition::WentDown),
+        (false, true) => Some(Transition::CameUp),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Applies each event in `trace` to `start`, checking the state after
+    /// every step.
     fn assert_trace(start: i8, thresholds: &Thresholds, trace: &[(CheckResult, i8)]) {
         let mut state = start;
-        for (step, &(event, expected)) in trace.into_iter().enumerate() {
-            state = next_state(state, event, &thresholds);
+        for (step, &(event, expected)) in trace.iter().enumerate() {
+            state = next_state(state, event, thresholds);
             assert_eq!(state, expected, "wrong state after step {}", step + 1);
         }
     }
@@ -118,6 +155,7 @@ mod tests {
             ],
         );
     }
+
     #[test]
     fn fall_of_one_switches_down_on_first_failure() {
         // Guards the `state + 1 >= fall` boundary: one failure from a
@@ -150,5 +188,27 @@ mod tests {
     fn thresholds_accept_range_limits() {
         assert!(Thresholds::new(1, 1).is_ok());
         assert!(Thresholds::new(127, 127).is_ok());
+    }
+
+    #[test]
+    fn transition_reports_switch_to_down() {
+        assert_eq!(transition(2, -1), Some(Transition::WentDown));
+    }
+
+    #[test]
+    fn transition_reports_switch_to_up() {
+        assert_eq!(transition(-2, 0), Some(Transition::CameUp));
+    }
+
+    #[test]
+    fn transition_ignores_streak_changes_while_up() {
+        assert_eq!(transition(0, 1), None);
+        assert_eq!(transition(1, 0), None);
+    }
+
+    #[test]
+    fn transition_ignores_streak_changes_while_down() {
+        assert_eq!(transition(-1, -2), None);
+        assert_eq!(transition(-2, -1), None);
     }
 }
